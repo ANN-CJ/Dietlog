@@ -521,16 +521,40 @@ function getSettings(){
 function getKey(){return localStorage.getItem('dl_gemini_key')||'';}
 
 // ── Gemini API ──
-async function callGemini(prompt,imageParts){
-  const key=getKey();
-  if(!key){alert('⚠️ 請先到「設定」頁填入 Gemini API Key！');throw new Error('nokey');}
-  const url=`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
-  const parts=imageParts?[...imageParts,{text:prompt}]:[{text:prompt}];
-  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({contents:[{parts}]})});
-  const json=await res.json();
-  if(json.error)throw new Error(json.error.message);
-  return json.candidates[0].content.parts[0].text;
+async function callGemini(prompt, base64Data = null) {
+  const key = localStorage.getItem('dl_gemini_key');
+  if (!key) {
+    alert('請先在設定中輸入 API Key');
+    showTab('settings-page');
+    throw new Error('nokey');
+  }
+
+  // 確保網址正確
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
+  
+  const contents = [{
+    parts: [{ text: prompt }]
+  }];
+
+  // 如果有圖片資料，加入 inline_data
+  if (base64Data) {
+    contents[0].parts.push({
+      inline_data: { mime_type: "image/jpeg", data: base64Data }
+    });
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents })
+  });
+
+  const data = await response.json();
+  if (data.error) throw new Error(data.error.message);
+  
+  // 這裡回傳純文字，並自動修復 AI 可能帶有的 Markdown 標籤
+  let text = data.candidates[0].content.parts[0].text;
+  return text.replace(/```json|```/g, "").trim();
 }
 
 // ── Tabs ──
@@ -688,7 +712,76 @@ function toggleManual(){
   document.getElementById('tog-manual').textContent=manualOn?'❌ 取消手動輸入':'✏️ 手動輸入數值';
 }
 
-async function handlePhoto(input){
+async function handlePhoto(input) {
+  const file = input.files[0];
+  if (!file) return;
+
+  // 1. UI 狀態處理
+  const preview = document.getElementById('f-preview') || document.getElementById('photo-preview');
+  const loading = document.getElementById('f-analyzing') || document.getElementById('analyzing');
+  const aiTxt = document.getElementById('ai-txt'); // 您原本用來顯示按鈕文字的 ID
+
+  if (preview) {
+    preview.src = URL.createObjectURL(file);
+    preview.style.display = 'block';
+  }
+  if (loading) loading.classList.add('show');
+  if (aiTxt) aiTxt.textContent = '✦ 分析中...';
+
+  const reader = new FileReader();
+  reader.readAsDataURL(file);
+  reader.onload = (e) => {
+    const img = new Image();
+    img.src = e.target.result;
+    img.onload = async () => {
+      // 2. 核心壓縮邏輯：縮小到 800 像素以解決 iPhone 413 錯誤
+      const canvas = document.createElement('canvas');
+      const MAX_WIDTH = 800;
+      const scale = MAX_WIDTH / img.width;
+      canvas.width = MAX_WIDTH;
+      canvas.height = img.height * scale;
+      
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      
+      // 壓縮品質為 0.7 的 Base64
+      const base64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+      
+      try {
+        // 3. 呼叫 API (請確保 prompt 要求回傳您原始代碼需要的欄位名)
+        const prompt = "你是一位專業營養師。辨識圖中食物並估算營養。僅回傳 JSON：{\"name\":\"名稱\",\"kcal\":熱量,\"protein\":蛋白質,\"fat\":脂肪,\"carb\":碳水,\"note\":\"備註\"}";
+        const result = await callGemini(prompt, base64);
+        
+        // 4. 解析結果
+        const json = JSON.parse(result.replace(/```json|```/g, '').trim());
+        
+        // 5. 填入原始功能對應的欄位
+        if (json.name && document.getElementById('f-name')) {
+          document.getElementById('f-name').value = json.name;
+        }
+        
+        // 填入您預覽卡片中的數字 (ar-kcal, ar-p 等)
+        if (document.getElementById('ar-kcal')) document.getElementById('ar-kcal').textContent = json.kcal;
+        if (document.getElementById('ar-p')) document.getElementById('ar-p').textContent = json.protein + 'g';
+        if (document.getElementById('ar-f')) document.getElementById('ar-f').textContent = json.fat + 'g';
+        if (document.getElementById('ar-c')) document.getElementById('ar-c').textContent = json.carb + 'g';
+        if (document.getElementById('ar-note')) document.getElementById('ar-note').textContent = json.note || '';
+
+        // 顯示結果區塊 (對應您的 ai-result class)
+        const resultBox = document.getElementById('ai-result');
+        if (resultBox) resultBox.classList.add('show');
+        if (aiTxt) aiTxt.textContent = '✦ 重新估算';
+
+      } catch (err) {
+        console.error("AI 分析失敗:", err);
+        if (aiTxt) aiTxt.textContent = '⚠ 失敗，請重試';
+        alert("分析失敗，請檢查 API Key 或網路狀況。");
+      } finally {
+        if (loading) loading.classList.remove('show');
+      }
+    };
+  };
+}
   const file=input.files[0];if(!file)return;
   const reader=new FileReader();
   reader.onload=async(e)=>{
@@ -703,7 +796,6 @@ async function handlePhoto(input){
     await aiAnalyze(true);
   };
   reader.readAsDataURL(file);
-}
 
 async function aiAnalyze(fromPhoto=false){
   const name=document.getElementById('f-name').value.trim();
@@ -939,19 +1031,24 @@ function buildCtx(){
 最近體重：${logs.map(l=>`${l.date} ${l.weight}kg${l.bf?` 體脂${l.bf}%`:''}`).join('、')||'無'}`;
 }
 
-async function genDaily(){
-  const btn=document.getElementById('daily-btn');btn.disabled=true;
-  document.getElementById('daily-txt').innerHTML='<span class="spinner"></span> 分析中...';
-  try{
-    const txt=await callGemini(`你是健身飲食教練，用繁體中文，親切專業。根據以下資料給今日建議，200字內，分3-4點，每點用emoji開頭：\n${buildCtx()}`);
-    document.getElementById('daily-body').textContent=txt;
-    document.getElementById('daily-sub').textContent=new Date().toLocaleDateString('zh-TW');
-    document.getElementById('daily-txt').textContent='✦ 重新產生';
-  }catch(e){
-    if(e.message!=='nokey')document.getElementById('daily-body').textContent='分析失敗，請確認 API Key 是否正確。';
-    document.getElementById('daily-txt').textContent='✦ 重試';
+async function genDaily() {
+  const btn = document.getElementById('daily-btn');
+  const body = document.getElementById('daily-body');
+  btn.disabled = true;
+  body.innerText = "AI 正在分析今日數據...";
+
+  try {
+    // 這裡建立你的資料內容 (Context)
+    const ctx = `今日熱量攝取: ${document.getElementById('r-cal').innerText}, 蛋白質: ${document.getElementById('mv-p').innerText}`;
+    const prompt = `你是健身飲食教練，用繁體中文，親切專業。根據以下資料給今日建議，200字內，分3-4點，每點用emoji開頭：${ctx}`;
+    
+    const advice = await callGemini(prompt);
+    body.innerText = advice;
+  } catch (e) {
+    body.innerText = "建議產生失敗，請檢查 Key。";
+  } finally {
+    btn.disabled = false;
   }
-  btn.disabled=false;
 }
 
 async function genWeekly(){
@@ -1011,3 +1108,4 @@ renderAll();
 </script>
 </body>
 </html>
+
