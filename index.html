@@ -521,18 +521,39 @@ function getSettings(){
 function getKey(){return localStorage.getItem('dl_gemini_key')||'';}
 
 // ── Gemini API ──
-async function callGemini(prompt,imageParts){
-  const key=getKey();
-  if(!key){alert('⚠️ 請先到「設定」頁填入 Gemini API Key！');throw new Error('nokey');}
-  const url=`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
-  const parts=imageParts?[...imageParts,{text:prompt}]:[{text:prompt}];
-  const res=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({contents:[{parts}]})});
-  const json=await res.json();
-  if(json.error)throw new Error(json.error.message);
-  return json.candidates[0].content.parts[0].text;
-}
+  
+async function callGemini(prompt, base64Data = null) {
+  const key = localStorage.getItem('dl_gemini_key');
+  if (!key) throw new Error('nokey');
 
+  // 修正後的正確 URL
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${key}`;
+
+  const payload = {
+    contents: [{
+      parts: [{ text: prompt }]
+    }]
+  };
+
+  // 支援圖片傳輸
+  if (base64Data) {
+    payload.contents[0].parts.push({
+      inline_data: { mime_type: "image/jpeg", data: base64Data }
+    });
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  
+  // 回傳內容並過濾掉 AI 可能帶有的 Markdown 標籤
+  return data.candidates[0].content.parts[0].text.replace(/```json|```/g, '').trim();
+}
 // ── Tabs ──
 function showTab(tab){
   curTab=tab;
@@ -687,7 +708,58 @@ function toggleManual(){
   document.getElementById('manual-area').style.display=manualOn?'block':'none';
   document.getElementById('tog-manual').textContent=manualOn?'❌ 取消手動輸入':'✏️ 手動輸入數值';
 }
+async function handlePhoto(input) {
+  const file = input.files[0];
+  if (!file) return;
 
+  const preview = document.getElementById('f-preview');
+  const loading = document.getElementById('f-analyzing');
+  const btnTxt = document.getElementById('ai-txt');
+
+  preview.src = URL.createObjectURL(file);
+  preview.style.display = 'block';
+  loading.classList.add('show');
+  btnTxt.textContent = '✦ 分析中...';
+
+  const reader = new FileReader();
+  reader.readAsDataURL(file);
+  reader.onload = (e) => {
+    const img = new Image();
+    img.src = e.target.result;
+    img.onload = async () => {
+      // 壓縮圖片到 800px，避免 413 Payload Too Large 錯誤
+      const canvas = document.createElement('canvas');
+      const scale = 800 / img.width;
+      canvas.width = 800;
+      canvas.height = img.height * scale;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      
+      const base64 = canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+      
+      try {
+        const prompt = "你是一位營養師，辨識圖中食物並估算熱量。僅回傳 JSON：{\"name\":\"名稱\",\"kcal\":熱量,\"protein\":蛋白質,\"fat\":脂肪,\"carb\":碳水}";
+        const result = await callGemini(prompt, base64);
+        const json = JSON.parse(result);
+
+        // 填入資料到你的 HTML 欄位
+        document.getElementById('f-name').value = json.name;
+        document.getElementById('ar-kcal').textContent = json.kcal;
+        document.getElementById('ar-p').textContent = json.protein + 'g';
+        document.getElementById('ar-f').textContent = json.fat + 'g';
+        document.getElementById('ar-c').textContent = json.carb + 'g';
+        
+        document.getElementById('ai-result').classList.add('show');
+        btnTxt.textContent = '✦ 重新估算';
+      } catch (err) {
+        console.error(err);
+        btnTxt.textContent = '⚠ 失敗，請重試';
+      } finally {
+        loading.classList.remove('show');
+      }
+    };
+  };
+}
 async function handlePhoto(input){
   const file=input.files[0];if(!file)return;
   const reader=new FileReader();
@@ -705,40 +777,6 @@ async function handlePhoto(input){
   reader.readAsDataURL(file);
 }
 
-async function aiAnalyze(fromPhoto=false){
-  const name=document.getElementById('f-name').value.trim();
-  if(!fromPhoto&&!name){alert('請輸入食物名稱，或上傳照片');return;}
-  const btn=document.getElementById('ai-btn');
-  btn.disabled=true;
-  document.getElementById('ai-txt').innerHTML='<span class="spinner"></span> 分析中...';
-  try{
-    let imageParts=null,prompt;
-    if(fromPhoto&&photoB64){
-      imageParts=[{inlineData:{mimeType:photoMime,data:photoB64}}];
-      prompt='請辨識圖片中的食物，估算熱量與營養素。只回傳JSON（無其他文字或Markdown）：{"name":"食物名稱","kcal":整數,"protein":整數,"fat":整數,"carb":整數,"emoji":"emoji","note":"說明15字內"}';
-    }else{
-      prompt=`你是台灣飲食熱量估算專家。估算「${name}」，只回傳JSON（無其他文字或Markdown符號）：{"name":"${name}","kcal":整數,"protein":整數,"fat":整數,"carb":整數,"emoji":"食物emoji","note":"說明15字內"}`;
-    }
-    const txt=await callGemini(prompt,imageParts);
-    const json=JSON.parse(txt.replace(/```json|```/g,'').trim());
-    curAi=json;
-    if(json.name&&!document.getElementById('f-name').value)document.getElementById('f-name').value=json.name;
-    document.getElementById('ar-kcal').textContent=json.kcal;
-    document.getElementById('ar-p').textContent=json.protein+'g';
-    document.getElementById('ar-f').textContent=json.fat+'g';
-    document.getElementById('ar-c').textContent=json.carb+'g';
-    document.getElementById('ar-note').textContent=json.note||'';
-    document.getElementById('ai-result').classList.add('show');
-    document.getElementById('ai-txt').textContent='✦ 重新估算';
-  }catch(e){
-    if(e.message!=='nokey'){
-      document.getElementById('ai-txt').textContent='⚠ 失敗，請手動輸入';
-      if(!manualOn)toggleManual();
-    }else{document.getElementById('ai-txt').textContent='✦ AI 自動估算熱量';}
-  }
-  document.getElementById('analyzing').classList.remove('show');
-  btn.disabled=false;
-}
 
 function saveFood(){
   const name=document.getElementById('f-name').value.trim();
